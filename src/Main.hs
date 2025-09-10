@@ -22,6 +22,9 @@ module Main
   (main)
 where
 
+import qualified ModelNotes as MN
+import qualified NewPerspective as NP
+
 import qualified BlueRipple.Configuration as BR
 import qualified BlueRipple.Data.Types.Demographic as DT
 import qualified BlueRipple.Data.Types.Election as ET
@@ -83,8 +86,8 @@ import qualified Frames.Serialize as FS
 import Path (Dir, Rel)
 import qualified Path
 import qualified Numeric
-import qualified Stan.ModelBuilder.DesignMatrix as DM
-import qualified Stan.ModelBuilder.TypedExpressions.Types as TE
+import qualified Stan.Libraries.BuildingBlocks as SBB
+import qualified Stan as ST
 
 import qualified Data.Map.Strict as M
 
@@ -97,7 +100,7 @@ import qualified Graphics.Vega.VegaLite.JSON as VJ
 import GHC.TypeLits (Symbol)
 --import System.Environment as Env
 
-import qualified ModelNotes as MN
+
 import qualified System.Environment as Env
 
 
@@ -172,7 +175,7 @@ main = do
     pandocTemplate
     templateVars
     (BRK.brWriterOptionsF . K.mindocOptionsF)
-  cacheDir <- toText . fromMaybe ".kh-cache" <$> Env.lookupEnv("BR_CACHE_DIR")
+  cacheDir <- toText . fromMaybe ".kh-cache" <$> Env.lookupEnv "BR_CACHE_DIR"
   let knitConfig ∷ K.KnitConfig BRCC.SerializerC BRCC.CacheData Text =
         (K.defaultKnitConfig $ Just cacheDir)
           { K.outerLogPrefix = Just "2023-StateLeg"
@@ -187,6 +190,13 @@ main = do
     let postInfo = BR.PostInfo (BR.postStage cmdLine) (BR.PubTimes BR.Unpublished Nothing)
         histCompetitive :: F.Record AnalyzeStateR -> Bool
         histCompetitive r = let x = r ^. ET.demShare in (x > 0.40 && x < 0.60)
+
+        histLongish :: F.Record AnalyzeStateR -> Bool
+        histLongish r = let x = r ^. ET.demShare in (x > 0.35 && x < 0.45)
+        modelPlausible :: F.Record AnalyzeStateR -> Bool
+        modelPlausible r = MT.ciUpper (r ^. MR.modelCI) >= 0.5
+        educatedWNH :: F.Record AnalyzeStateR -> Bool
+        educatedWNH r = r ^. DP.fracGradOfWhite > 0.25
         rural ::  F.Record AnalyzeStateR -> Bool
         rural r = r ^. DT.pWPopPerSqMile <= 100
     stateUpperOnlyM <- BRL.stateUpperOnlyMap
@@ -194,17 +204,17 @@ main = do
           [
 --            ("GA", histCompetitive)
 --          , ("WI", histCompetitive)
---          , ("VA", histCompetitive)
+            ("VA", getAll . (All . histLongish <> All . educatedWNH <> All . modelPlausible))
 --          , ("AZ", histCompetitive)
 --          , ("KS", histCompetitive)
 --          , ("MI", histCompetitive)
 --          , ("MS", histCompetitive)
 --          , ("NV", histCompetitive)
 --          , ("NH", histCompetitive)
-           ("PA", histCompetitive)
+--          , ("PA", histCompetitive)
           ]
     traverse_ (uncurry $ analyzeStatePost cmdLine postInfo stateUpperOnlyM dlccMap) postsToDo
-
+--    dobbsEffectCompare cmdLine stateUpperOnlyM dlccMap "PA"
   case resE of
     Right namedDocs →
       K.writeAllPandocResultsWithInfoAsHtml "" namedDocs
@@ -254,7 +264,9 @@ analyzeState cmdLine tc tScenarioM pc pScenarioM stateUpperOnlyMap dlccMap state
   draShareOverrides_C <- DP.loadOverrides (draPath <> "DRA_Shares/DRA_Share.csv") "DRA 2016-2021"
   let dVSPres2020 = DP.ElexTargetConfig "PresWO" draShareOverrides_C 2020 presidentialElections_C
       dVSHouse2022 = DP.ElexTargetConfig "HouseWO" draShareOverrides_C 2022 houseElections_C
-      dVSModel psName
+--  cesImpliedPrefTargets <- K.ignoreCacheTimeM $ MR.statePrefDTargets (MR.CESImpliedDVotes cesVVByState_C)  (cacheStructureF False "AllCells")
+--  let cesElexTgt = DP.DShareTargetConfig
+  let dVSModel psName
         = MR.runFullModelAH @SLDKeyR 2020 (cacheStructure state psName) tc tScenarioM pc pScenarioM (MR.VoteDTargets dVSPres2020)
   modeledDVSMap <- K.ignoreCacheTimeM $ dVSModel (state <> "_SLD") stateSLDs_C
   allPlansMap <- DRA.allPassedSLDPlans 2024 BRC.TY2021
@@ -292,20 +304,32 @@ mwoColonnade cas =
      <> C.headed "CD PPL" (BR.toCell cas' "CD PPL" "CD PPL" (rbStyle "%2.1f" . (100*) . view DO.congressionalPPL))
      <> C.headed "Overlap" (BR.toCell cas' "Overlap" "Overlap" (BR.numberToStyledHtml "%2.0f" . (100*) . view DO.overlap))
 
-dmr ::  DM.DesignMatrixRow (F.Record DP.LPredictorsR)
+dmr ::  Text -> ST.DesignMatrixRow (F.Record DP.LPredictorsR)
 dmr = MC.tDesignMatrixRow_d
 
 survey :: MC.ActionSurvey (F.Record DP.CESByCDR)
 survey = MC.CESSurvey (DP.AllSurveyed DP.Both)
 
 --aggregation :: MC.SurveyAggregation TE.EInt
-aggregation = MC.UnweightedAggregation
+aggregation = MC.WeightedAggregation MC.ContinuousBinomial DP.DesignEffectWeights
 
 alphaModel :: MC.Alphas
 alphaModel =  MC.St_A_S_E_R_StA_StS_StE_StR_AS_AE_AR_SE_SR_ER_StER --MC.St_A_S_E_R_AE_AR_ER_StR --MC.St_A_S_E_R_ER_StR_StER
-              --      alphaModel =  MC.St_A_S_E_R_ER_StR_StER
+--alphaModel =  MC.St_A_S_E_R_ER_StR_StER
+
 psDataForState :: Text -> DP.PSData SLDKeyR -> DP.PSData SLDKeyR
 psDataForState sa = DP.PSData . F.filterFrame ((== sa) . view GT.stateAbbreviation) . DP.unPSData
+
+
+newPerspectivePost :: (K.KnitMany r, BRCC.CacheEffects r)
+               => BR.CommandLine
+               -> K.Sem r ()
+newPerspectivePost cmdLine = do
+  newPerspectivePostPaths <- postPaths "NewPerspective" cmdLine
+  let postInfo = BR.PostInfo (BR.postStage cmdLine)
+                 (BR.PubTimes BR.Unpublished Nothing)
+  BRK.brNewPost newPerspectivePostPaths postInfo "NewPerspective" $ do
+    BRK.brAddMarkDown NP.part1
 
 modelNotesPost :: (K.KnitMany r, BRCC.CacheEffects r)
                => BR.CommandLine
@@ -316,8 +340,8 @@ modelNotesPost cmdLine = do
   let postInfo = BR.PostInfo (BR.postStage cmdLine)
                  (BR.PubTimes (BR.Published $ Time.fromGregorian 2023 12 6) Nothing)
   BRK.brNewPost modelNotesPostPaths postInfo "ModelNotes" $ do
-    let  turnoutConfig agg am = MC.ActionConfig survey (MC.ModelConfig agg am (contramap F.rcast dmr))
-         prefConfig agg am = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig agg am (contramap F.rcast dmr))
+    let  turnoutConfig agg am = MC.ActionConfig survey (MC.ModelConfig agg am (contramap F.rcast (dmr "T")))
+         prefConfig agg am = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig agg am (contramap F.rcast (dmr "P")))
          lowerOnly r = r ^. GT.districtTypeC == GT.StateLower
 --         upperOnly r = r ^. GT.districtTypeC == GT.StateUpper
          dName = view GT.districtName
@@ -400,6 +424,84 @@ modelNotesPost cmdLine = do
     BRK.brAddMarkDown MN.part6
     pure ()
 
+dobbsEffectCompare ::  (K.KnitMany r, BRCC.CacheEffects r)
+                   => BR.CommandLine
+                   -> Map Text Bool
+                   -> Map Text [(GT.DistrictType, Text, Text)]
+                   -> Text
+                   -> K.Sem r ()
+dobbsEffectCompare cmdLine stateUpperOnlyMap dlccMap state = do
+  let turnoutConfig = MC.ActionConfig survey (MC.ModelConfig aggregation alphaModel (contramap F.rcast $ dmr "T"))
+      prefConfig = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig aggregation alphaModel (contramap F.rcast $ dmr "P"))
+      dobbsTurnoutF r = if (r ^. DT.sexC == DT.Female) then MR.adjustP 0.05 else id
+      dobbsTurnoutS = MR.SimpleScenario "DobbsT" dobbsTurnoutF
+      dobbsPrefS = MR.SimpleScenario "DobbsP" dobbsTurnoutF
+      scenarioTitle = "Dobbs Effect Scenario"
+  scenarioComparePostPaths <- postPaths scenarioTitle cmdLine
+  let postInfo = BR.PostInfo (BR.postStage cmdLine)
+                 (BR.PubTimes BR.Unpublished Nothing)
+      districtFilter =  getAll . ((All . ratingChangeFilter) <> (All . closeFilter 0.45 0.55))
+  BRK.brNewPost scenarioComparePostPaths postInfo scenarioTitle $ do
+    scenarioCompareDistricts cmdLine turnoutConfig (Just dobbsTurnoutS) prefConfig (Just dobbsPrefS) districtFilter
+      stateUpperOnlyMap dlccMap state scenarioTitle
+
+br2024InPlay :: (K.KnitMany r, BRCC.CacheEffects r)
+             => BR.CommandLine
+             -> Map Text Bool
+             -> Map Text [(GT.DistrictType, Text, Text)]
+             -> K.Sem r ()
+br2024InPlay cmdLine stateUpperOnlyMap dlccMap = do
+  let turnoutConfig = MC.ActionConfig survey (MC.ModelConfig aggregation alphaModel (contramap F.rcast $ dmr "T"))
+      prefConfig = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig aggregation alphaModel (contramap F.rcast $ dmr "P"))
+      dobbsTurnoutF r = if (r ^. DT.sexC == DT.Female) then MR.adjustP 0.05 else id
+      dobbsTurnoutS = MR.SimpleScenario "DobbsT" dobbsTurnoutF
+      dobbsPrefS = MR.SimpleScenario "DobbsP" dobbsTurnoutF
+  pure ()
+
+type ScenarioDataR = [ET.DemShare, MR.ModelCI]
+
+ratingChangeFilter :: (F.Record ScenarioDataR, Double) -> Bool
+ratingChangeFilter =  (/= "No Change") . ratingChange
+   where
+     hpl = view ET.demShare . fst
+     ratingChange x = CE.ratingChangeText (leanRating $ hpl x) (leanRating $ hpl x + snd x)
+
+closeFilter :: Double -> Double -> (F.Record ScenarioDataR, Double) -> Bool
+closeFilter lo hi x = (hpl x >= lo) && (hpl x <= hi)
+  where
+    hpl = view ET.demShare . fst
+
+scenarioCompareDistricts :: (K.KnitOne r, BRCC.CacheEffects r)
+                         => BR.CommandLine
+                         -> MC.ActionConfig a b
+                         -> Maybe (MR.Scenario DP.PredictorsR)
+                         -> MC.PrefConfig b
+                         -> Maybe (MR.Scenario DP.PredictorsR)
+                         -> ((F.Record ScenarioDataR, Double) -> Bool)
+                         -> Map Text Bool
+                         -> Map Text [(GT.DistrictType, Text, Text)]
+                         -> Text
+                         -> Text
+                         -> K.Sem r ()
+scenarioCompareDistricts cmdLine tc tScenarioM pc pScenarioM distFilter stateUpperOnlyMap dlccMap state scenarioTitle = do
+  baseline <- analyzeState cmdLine tc Nothing pc Nothing stateUpperOnlyMap dlccMap state
+  withScenario <- analyzeState cmdLine tc tScenarioM pc pScenarioM stateUpperOnlyMap dlccMap state
+  let key :: F.Record AnalyzeStateR -> F.Record [GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName]
+      key = F.rcast
+      blRec :: F.Record AnalyzeStateR -> F.Record [ET.DemShare, MR.ModelCI]
+      blRec = F.rcast
+      mid = MT.ciMid . view MR.modelCI
+      scenarioDelta b s = mid s - mid b
+      cols = F.rcast @[ET.DemShare, MR.ModelCI]
+  bsMap <- K.knitEither $ mergeAnalyses key (\b s -> (key b, (blRec b, scenarioDelta b s))) baseline withScenario
+  let hpl x = view ET.demShare . fst $ snd x
+--      ratingChange x = CE.ratingChangeText (leanRating $ hpl x) (leanRating $ hpl x + snd (snd x))
+  BR.brAddRawHtmlTable (Just scenarioTitle) (BHA.class_ "brTable") (scenarioCompColonnade mempty)
+--    $ filter ((/= "No Change") . ratingChange)
+    $ filter (distFilter . snd)
+--    $ filter ((> 0.45) . hpl)
+    $ FL.fold FL.list bsMap
+
 
 leanRating :: Double -> CE.LeanRating
 leanRating = CE.leanRating 0.10 0.05 0.01
@@ -464,8 +566,8 @@ analyzeStatePost cmdLine postInfo stateUpperOnlyMap dlccMap state include = do
                                     psName "AllCells" state
 
   BRK.brNewPost modelPostPaths postInfo state $ do
-    let  turnoutConfig agg am = MC.ActionConfig survey (MC.ModelConfig agg am (contramap F.rcast dmr))
-         prefConfig agg am = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig agg am (contramap F.rcast dmr))
+    let  turnoutConfig agg am = MC.ActionConfig survey (MC.ModelConfig agg am (contramap F.rcast $ dmr "T"))
+         prefConfig agg am = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig agg am (contramap F.rcast $ dmr "P"))
     modeledAndDRA <- analyzeState cmdLine (turnoutConfig aggregation alphaModel) Nothing (prefConfig aggregation alphaModel) Nothing stateUpperOnlyMap dlccMap state
     upperOnly <- K.knitMaybe ("analyzeStatePost: " <> state <> " missing from stateUpperOnlyMap") $ M.lookup state stateUpperOnlyMap
 
@@ -516,13 +618,13 @@ analyzeStatePost cmdLine postInfo stateUpperOnlyMap dlccMap state include = do
       (FV.fixedSizeVC 500 300 10) state mapYear detailChamber dName ("College Grad (%)", \r -> 100 * (r ^. DP.fracCollegeGrad), Nothing, Nothing)
       (F.filterFrame dOnly modeledAndDRA)
       >>= K.addHvega Nothing Nothing
-    let draCompetitive r = let x = r ^. ET.demShare in (x > 0.40 && x < 0.60)
-    BR.brAddRawHtmlTable (Just $ state <> " model (2020 data): Upper House") (BHA.class_ "brTable") (sldColonnade mempty {- $ sldTableCellStyle state -})
+    let draCompetitive r = let x = r ^. ET.demShare in (x > 0.35 && x < 0.65)
+    BR.brAddRawHtmlTable (Just $ state <> " model (2020 data): Upper House") (BHA.class_ "brTable") (sldColonnade True mempty {- $ sldTableCellStyle state -})
       $ sortBy byDistrictName $ FL.fold FL.list
       $ F.filterFrame include
       $ F.filterFrame ((== GT.StateUpper) . view GT.districtTypeC) modeledAndDRA
     when (not upperOnly)
-      $ BR.brAddRawHtmlTable (Just $ state <> " model (2020 data): Lower House") (BHA.class_ "brTable") (sldColonnade mempty {-$ sldTableCellStyle state -})
+      $ BR.brAddRawHtmlTable (Just $ state <> " model (2020 data): Lower House") (BHA.class_ "brTable") (sldColonnade True mempty {-$ sldTableCellStyle state -})
       $ sortBy byDistrictName $ FL.fold FL.list
       $ F.filterFrame include
       $ F.filterFrame ((== GT.StateLower) . view GT.districtTypeC) modeledAndDRA
@@ -909,18 +1011,27 @@ leansCellStyle col pl =
   in mconcat [longShotCS, leanRCS, leanDCS, safeDCS]
 
 sldColonnade :: (FC.ElemsOf rs [GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName, MR.ModelCI, ET.DemShare])
-             => BR.CellStyleF (F.Record rs) [Char] -> C.Colonnade C.Headed (F.Record rs) K.Cell
-sldColonnade cas =
+             => Bool -> BR.CellStyleF (F.Record rs) [Char] -> C.Colonnade C.Headed (F.Record rs) K.Cell
+sldColonnade midOnly cas =
   let state = F.rgetField @GT.StateAbbreviation
       share5 = MT.ciLower . F.rgetField @MR.ModelCI
       share50 = MT.ciMid . F.rgetField @MR.ModelCI
       share95 = MT.ciUpper . F.rgetField @MR.ModelCI
   in C.headed "State" (BR.toCell cas "State" "State" (BR.textToStyledHtml . state))
      <> C.headed "District" (BR.toCell cas "District" "District" (BR.textToStyledHtml . fullDNameText))
-     <> C.headed "Historical" (BR.toCell cas "Historical" "Historical" (rbStyle "%2.1f" . (100*) . F.rgetField @ET.DemShare))
-     <> C.headed "5%" (BR.toCell cas "5%" "5%" (rbStyle "%2.1f" . (100*) . share5))
-     <> C.headed "50%" (BR.toCell cas "50%" "50%" (rbStyle "%2.1f" . (100*) . share50))
-     <> C.headed "95%" (BR.toCell cas "95%" "95%" (rbStyle "%2.1f" . (100*) . share95))
+     <> C.headed "Historical D-Share" (BR.toCell cas "Historical" "Historical" (rbStyle "%2.1f" . (100*) . F.rgetField @ET.DemShare))
+     <> (if midOnly
+          then mempty
+          else C.headed "5%" (BR.toCell cas "5%" "5%" (rbStyle "%2.1f" . (100*) . share5))
+        )
+     <> (if midOnly
+         then C.headed "Model (Median) D-Share" (BR.toCell cas "50%" "50%" (rbStyle "%2.1f" . (100*) . share50))
+         else C.headed "50%" (BR.toCell cas "50%" "50%" (rbStyle "%2.1f" . (100*) . share50))
+        )
+     <> (if midOnly
+          then mempty
+          else C.headed "95%" (BR.toCell cas "95%" "95%" (rbStyle "%2.1f" . (100*) . share95))
+        )
 
 
 dTypeText' :: GT.DistrictType -> Text
