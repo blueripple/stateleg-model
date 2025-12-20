@@ -52,6 +52,8 @@ import qualified BlueRipple.Model.Demographic.DataPrep as CDDP
 import qualified BlueRipple.Model.Demographic.TableProducts as DTP
 import qualified BlueRipple.Model.Demographic.TPModel3 as DTM3
 import qualified BlueRipple.Model.CategorizeElection as CE
+import qualified BlueRipple.Tools.StateLeg.Analysis as MTSA
+import qualified BlueRipple.Tools.StateLeg.ModeledACS as TSACS
 
 import qualified Knit.Report as K
 import qualified Knit.Effect.AtomicCache as KC
@@ -78,6 +80,8 @@ import qualified Frames.Constraints as FC
 import qualified Frames.SimpleJoins as FJ
 import qualified Frames.Streamly.InCore as FSI
 import qualified Frames.Streamly.TH as FTH
+import qualified Frames.Streamly.CSV as FCSV
+import Frames.Streamly.Streaming.Streamly (StreamlyStream, Stream)
 
 import qualified Text.Blaze.Html as HTML
 
@@ -86,7 +90,6 @@ import qualified Frames.Serialize as FS
 import Path (Dir, Rel)
 import qualified Path
 import qualified Numeric
-import qualified Stan.Libraries.BuildingBlocks as SBB
 import qualified Stan as ST
 
 import qualified Data.Map.Strict as M
@@ -98,15 +101,8 @@ import qualified Graphics.Vega.VegaLite.Configuration as FV
 import qualified Graphics.Vega.VegaLite.JSON as VJ
 
 import GHC.TypeLits (Symbol)
---import System.Environment as Env
-
-
 import qualified System.Environment as Env
 
-
---import qualified Data.Discrimination.Grouping  as G
-
---import Data.Monoid (Sum(getSum))
 FTH.declareColumn "StateModelT" ''Double
 FTH.declareColumn "StateModelP" ''Double
 FTH.declareColumn "Share" ''Double
@@ -166,6 +162,24 @@ dlccNH = [(GT.StateLower,"CO1","Cathleen Fountain")
 
 dlccMap = M.fromList [("LA",[]), ("MS",dlccMS), ("NJ", dlccNJ), ("VA", dlccVA)]
 
+dmr ::  Text -> ST.DesignMatrixRow (F.Record DP.LPredictorsR)
+dmr = MC.tDesignMatrixRow_d
+
+survey :: MC.ActionSurvey (F.Record DP.CESByCDR)
+survey = MC.CESSurvey (DP.AllSurveyed DP.Both)
+
+--aggregation :: MC.SurveyAggregation TE.EInt
+aggregation = MC.WeightedAggregation MC.ContinuousBinomial DP.DesignEffectWeights
+
+alphaModel :: MC.Alphas
+alphaModel =  MC.St_A_S_E_R_StA_StS_StE_StR_AS_AE_AR_SE_SR_ER_StER
+
+turnoutConfig :: MC.ActionConfig (F.Record DP.CESByCDR) ST.ECVec
+turnoutConfig = MC.ActionConfig survey (MC.ModelConfig aggregation alphaModel (contramap F.rcast (dmr "T")))
+
+prefConfig :: MC.PrefConfig ST.ECVec
+prefConfig = MC.PrefConfig (DP.Validated DP.Both) (MC.ModelConfig aggregation alphaModel (contramap F.rcast (dmr "P")))
+
 
 main :: IO ()
 main = do
@@ -200,20 +214,37 @@ main = do
         rural ::  F.Record AnalyzeStateR -> Bool
         rural r = r ^. DT.pWPopPerSqMile <= 100
     stateUpperOnlyM <- BRL.stateUpperOnlyMap
-    let postsToDo =
-          [
+--    let modeledAndDRAByState sa = analyzeState cmdLine turnoutConfig Nothing prefConfig Nothing stateUpperOnlyM dlccMap sa
+    let postsToDo = []
+--          [
 --            ("GA", histCompetitive)
 --          , ("WI", histCompetitive)
-            ("VA", getAll . (All . histLongish <> All . educatedWNH <> All . modelPlausible))
+--            ("VA", getAll . (All . histLongish <> All . educatedWNH <> All . modelPlausible))
 --          , ("AZ", histCompetitive)
 --          , ("KS", histCompetitive)
 --          , ("MI", histCompetitive)
 --          , ("MS", histCompetitive)
 --          , ("NV", histCompetitive)
 --          , ("NH", histCompetitive)
---          , ("PA", histCompetitive)
-          ]
-    traverse_ (uncurry $ analyzeStatePost cmdLine postInfo stateUpperOnlyM dlccMap) postsToDo
+--           ("PA", histCompetitive)
+--          ]
+        postF (sa, f) = analyzeStatePost cmdLine postInfo stateUpperOnlyM dlccMap sa f
+    traverse_ postF postsToDo
+    let overlapThreshold = 0.5
+    sldCDOverlapsToCSV cmdLine postInfo turnoutConfig prefConfig "PA" (Just overlapThreshold) "../../research/br-2023-StateLeg/csvForSwingLeft/sldCD.csv"
+    overlapPostPaths <- postPaths "overlaps" cmdLine
+{-    BRK.brNewPost overlapPostPaths postInfo "CD overlaps" $ do
+      let overlapsToDo = [("PA",[7,8,10])]
+          postF (sa, cds) = sldCDOverlaps cmdLine postInfo turnoutConfig prefConfig sa (Just overlapThreshold) cds
+      traverse_ postF overlapsToDo -}
+    sldCountyOverlapsToCSV cmdLine postInfo turnoutConfig prefConfig "PA" (Just overlapThreshold) "../../research/br-2023-StateLeg/csvForSwingLeft/sldCounty.csv"
+    BRK.brNewPost overlapPostPaths postInfo "County overlaps" $ do
+      let overlapsToDo = [("PA",["Bucks County"])]
+{-                          , "Montgomery County","Carbon County","Lehigh County","Northampton County", "Monroe County",
+                                "Lackawanna County", "Pike County", "Wayne County","Luzerne County", "Dauphin County", "Cumberland County",
+                                "York County"])]-}
+          postF (sa, counties) = sldCountyOverlaps cmdLine postInfo turnoutConfig prefConfig sa (Just overlapThreshold) counties
+      traverse_ postF overlapsToDo
 --    dobbsEffectCompare cmdLine stateUpperOnlyM dlccMap "PA"
   case resE of
     Right namedDocs →
@@ -236,6 +267,145 @@ type AnalyzeStateR = FJ.JoinResult3 [GT.StateAbbreviation, GT.DistrictTypeC, GT.
 
 draPathFromEnv :: IO Text
 draPathFromEnv = fromMaybe "data/" <$> (fmap (>>= BRCC.insureFinalSlash . toText) $ Env.lookupEnv "BR_DRA_DATA_DIR")
+
+
+sldCDOverlaps :: (Foldable f, BRCC.CacheEffects r, K.KnitOne r)
+              => BR.CommandLine
+              -> BR.PostInfo
+              → MC.ActionConfig a b
+              → MC.PrefConfig b
+              -> Text
+              -> Maybe Double
+              -> f Int
+              -> K.Sem r ()
+sldCDOverlaps cmdLine postInfo ac pc sa overlapThresholdM cds = K.wrapPrefix "sldCDOverlaps" $ do
+  K.logLE K.Info $ "State=" <> sa <> "; CDs=" <> show (FL.fold FL.list cds)
+  overlaps <- MTSA.sldsForCDs ac pc sa overlapThresholdM (Just cds)
+  BR.brAddRawHtmlTable (Just "SLD/CD Overlaps") (BHA.class_ "brTable") (mwoColonnadeCD mempty)
+    $ sortBy byDistrict $ FL.fold FL.list $ MTSA.removeMissingCDRows $ overlaps
+  modeledACS_C <- TSACS.modeledACSBySLD TSACS.Modeled
+  let stateSLDs_C = fmap (psDataForState sa) modeledACS_C
+  stateUpperOnlyMap <- BRL.stateUpperOnlyMap
+  modeledAndDRA <- analyzeState cmdLine ac Nothing pc Nothing stateUpperOnlyMap dlccMap sa
+  let toLogDensity = FT.fieldEndo @DT.PWPopPerSqMile (\x -> if x > 1 then Numeric.log x else 0)
+      summaryLD = fmap toLogDensity modeledAndDRA
+      (summaryMeans, summarySDs) = FL.fold DP.summaryMeanStd $ fmap F.rcast summaryLD
+      f :: F.Record DP.SummaryR -> F.Record DP.SummaryR
+      f r = F.withNames $ (r'  `recSubtract` m') `recDivide` s' where
+        r' = F.stripNames r
+        m' = F.stripNames summaryMeans
+        s' = F.stripNames summarySDs
+
+      normalizeSummary r = F.rcast @[GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName, ET.DemShare, MR.ModelCI] r
+                           F.<+> f (F.rcast @DP.SummaryR r)
+      csSummary = fmap normalizeSummary summaryLD
+  modelPostPaths <- postPaths "cd_overlaps" cmdLine
+  let cacheStructure state psName = MR.CacheStructure (Right "model/election2/stan/") (Right "model/election2")
+                                    psName "AllCells" state
+  let dists = FL.fold (FL.premap (\r -> (r ^. GT.districtTypeC, r ^. GT.districtName)) FL.set) overlaps
+  allDistrictDetails @'[DT.Race5C] cmdLine modelPostPaths postInfo (MR.modelCacheStructure $ cacheStructure sa "")
+    ac pc (Just dists) (show . view DT.race5C) "ByRace" sa stateSLDs_C csSummary
+
+
+sldCDOverlapsToCSV :: (BRCC.CacheEffects r, K.KnitEffects r)
+                   => BR.CommandLine
+                   -> BR.PostInfo
+                   → MC.ActionConfig a b
+                   → MC.PrefConfig b
+                   -> Text
+                   -> Maybe Double
+                   -> Text
+                   -> K.Sem r ()
+sldCDOverlapsToCSV cmdLine postInfo ac pc sa overlapThresholdM csvPath = do
+   overlaps <- MTSA.sldsForCDs @[] ac pc sa overlapThresholdM Nothing
+   let formatSLDCDOverlaps :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) [GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName, ET.DemShare, GT.CongressionalDistrict, DO.Overlap]
+       formatSLDCDOverlaps = FCSV.formatTextAsIs
+                             V.:& FCSV.formatWithShow
+                             V.:& FCSV.formatTextAsIs
+                             V.:& FCSV.formatAsPctWithPrintf 0
+                             V.:& FCSV.formatWithShow
+                             V.:& FCSV.formatAsPctWithPrintf 0
+                             V.:& V.RNil
+       newHeaderMap = M.fromList [("StateAbbreviation", "State")
+                                 , ("DistricTypeC", "District Type")
+                                 , ("DistrictName", "District Name")
+                                 , ("DemShare", "Historical D Share")
+                                 , ("CongressionalDistrict", "CD")
+                                 , ("Overlap", "Overlap (%)")
+                                 ]
+   K.liftKnit @IO $ FCSV.writeLines (toString $ csvPath)
+     $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatSLDCDOverlaps ","
+     $ FCSV.foldableToStream
+     $ fmap F.rcast
+     $ MTSA.removeMissingCDRows overlaps
+
+sldCountyOverlaps :: (Foldable f, BRCC.CacheEffects r, K.KnitOne r)
+                  => BR.CommandLine
+                  -> BR.PostInfo
+                  → MC.ActionConfig a b
+                  → MC.PrefConfig b
+                  -> Text
+                  -> Maybe Double
+                  -> f Text
+                  -> K.Sem r ()
+sldCountyOverlaps cmdLine postInfo ac pc sa overlapThresholdM counties = K.wrapPrefix "sldCountyOverlaps" $ do
+  K.logLE K.Info $ "State=" <> sa <> "; counties=" <> show (FL.fold FL.list counties)
+  overlaps <- MTSA.sldsForCounties ac pc sa overlapThresholdM (Just counties)
+  BR.brAddRawHtmlTable (Just "SLD/County Overlaps") (BHA.class_ "brTable") (mwoColonnadeCounty mempty)
+    $ sortBy byDistrict $ FL.fold FL.list $ overlaps
+  modeledACS_C <- TSACS.modeledACSBySLD TSACS.Modeled
+  let stateSLDs_C = fmap (psDataForState sa) modeledACS_C
+  stateUpperOnlyMap <- BRL.stateUpperOnlyMap
+  modeledAndDRA <- analyzeState cmdLine ac Nothing pc Nothing stateUpperOnlyMap dlccMap sa
+  let toLogDensity = FT.fieldEndo @DT.PWPopPerSqMile (\x -> if x > 1 then Numeric.log x else 0)
+      summaryLD = fmap toLogDensity modeledAndDRA
+      (summaryMeans, summarySDs) = FL.fold DP.summaryMeanStd $ fmap F.rcast summaryLD
+      f :: F.Record DP.SummaryR -> F.Record DP.SummaryR
+      f r = F.withNames $ (r'  `recSubtract` m') `recDivide` s' where
+        r' = F.stripNames r
+        m' = F.stripNames summaryMeans
+        s' = F.stripNames summarySDs
+
+      normalizeSummary r = F.rcast @[GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName, ET.DemShare, MR.ModelCI] r
+                           F.<+> f (F.rcast @DP.SummaryR r)
+      csSummary = fmap normalizeSummary summaryLD
+  modelPostPaths <- postPaths "county_overlaps" cmdLine
+  let cacheStructure state psName = MR.CacheStructure (Right "model/election2/stan/") (Right "model/election2")
+                                    psName "AllCells" state
+  let dists = FL.fold (FL.premap (\r -> (r ^. GT.districtTypeC, r ^. GT.districtName)) FL.set) overlaps
+  allDistrictDetails @'[DT.Race5C] cmdLine modelPostPaths postInfo (MR.modelCacheStructure $ cacheStructure sa "")
+    ac pc (Just dists) (show . view DT.race5C) "ByRace" sa stateSLDs_C csSummary
+
+sldCountyOverlapsToCSV :: (BRCC.CacheEffects r, K.KnitEffects r)
+                       => BR.CommandLine
+                       -> BR.PostInfo
+                       → MC.ActionConfig a b
+                       → MC.PrefConfig b
+                       -> Text
+                       -> Maybe Double
+                       -> Text
+                       -> K.Sem r ()
+sldCountyOverlapsToCSV cmdLine postInfo ac pc sa overlapThresholdM csvPath = do
+   overlaps <- MTSA.sldsForCounties @[] ac pc sa overlapThresholdM Nothing
+   let formatSLDCDOverlaps :: V.Rec (V.Lift (->) V.ElField (V.Const Text)) [GT.StateAbbreviation, GT.DistrictTypeC, GT.DistrictName, ET.DemShare, GT.CountyName, DO.Overlap]
+       formatSLDCDOverlaps = FCSV.formatTextAsIs
+                             V.:& FCSV.formatWithShow
+                             V.:& FCSV.formatTextAsIs
+                             V.:& FCSV.formatAsPctWithPrintf 0
+                             V.:& FCSV.formatTextAsIs
+                             V.:& FCSV.formatAsPctWithPrintf 0
+                             V.:& V.RNil
+       newHeaderMap = M.fromList [("StateAbbreviation", "State")
+                                 , ("DistricTypeC", "District Type")
+                                 , ("DistrictName", "District Name")
+                                 , ("DemShare", "Historical D Share")
+                                 , ("CountyName", "County")
+                                 , ("Overlap", "Overlap (%)")
+                                 ]
+   K.liftKnit @IO $ FCSV.writeLines (toString $ csvPath)
+     $ FCSV.streamSV' @_ @(StreamlyStream Stream) newHeaderMap formatSLDCDOverlaps ","
+     $ FCSV.foldableToStream
+     $ fmap F.rcast overlaps
 
 
 analyzeState :: (K.KnitEffects r, BRCC.CacheEffects r)
@@ -291,31 +461,32 @@ rbStyle = BR.numberToStyledHtmlFull False (BR.cellStyle BR.CellBackground . BR.P
 bordered :: Text -> BR.CellStyles
 bordered c = BR.solidBorderedCell c 3
 
-mwoColonnade :: forall rs . (FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName, ET.DemShare, GT.CongressionalDistrict, DO.Overlap, DO.CongressionalPPL])
-                     => BR.CellStyleF (F.Record rs) [Char] -> C.Colonnade C.Headed (F.Record rs) K.Cell
-mwoColonnade cas =
+mwoColonnadeCD :: forall rs . (FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName, ET.DemShare, GT.CongressionalDistrict, DO.Overlap, DO.CongressionalPPL])
+               => BR.CellStyleF (F.Record rs) [Char] -> C.Colonnade C.Headed (F.Record rs) K.Cell
+mwoColonnadeCD cas =
   let state = F.rgetField @GT.StateAbbreviation
       competitive r = let x = r ^. DO.congressionalPPL in x >= 0.45 && x <= 0.55
       cas' = cas <> BR.filledCell "DarkSeaGreen" `BR.cellStyleIf` \r h -> (h == "District") && competitive r
       olStyle = BR.numberToStyledHtmlFull False (BR.cellStyle BR.CellBackground . BR.PartColor . BR.numColorWhiteUntil 50 100 300)--BR.numberToStyledHtml' False "black" 75 "green"
   in C.headed "State District" (BR.toCell cas' "District" "District" (BR.textToStyledHtml . fullDNameText))
-     <> C.headed "State District PPL" (BR.toCell cas' "D. PPL" "D. PPL" (rbStyle "%2.1f" . (100*) . view ET.demShare))
+     <> C.headed "District D Share" (BR.toCell cas' "SLD D Share" "SLD D Share" (rbStyle "%2.1f" . (100*) . view ET.demShare))
      <> C.headed "CD" (BR.toCell cas' "CD" "CD" (BR.textToStyledHtml . show . view GT.congressionalDistrict))
-     <> C.headed "CD PPL" (BR.toCell cas' "CD PPL" "CD PPL" (rbStyle "%2.1f" . (100*) . view DO.congressionalPPL))
+     <> C.headed "CD D Share" (BR.toCell cas' "CD D Share" "CD D Share" (rbStyle "%2.1f" . (100*) . view DO.congressionalPPL))
      <> C.headed "Overlap" (BR.toCell cas' "Overlap" "Overlap" (BR.numberToStyledHtml "%2.0f" . (100*) . view DO.overlap))
 
-dmr ::  Text -> ST.DesignMatrixRow (F.Record DP.LPredictorsR)
-dmr = MC.tDesignMatrixRow_d
 
-survey :: MC.ActionSurvey (F.Record DP.CESByCDR)
-survey = MC.CESSurvey (DP.AllSurveyed DP.Both)
+mwoColonnadeCounty :: forall rs . (FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName, ET.DemShare, GT.CountyName, DO.Overlap])
+               => BR.CellStyleF (F.Record rs) [Char] -> C.Colonnade C.Headed (F.Record rs) K.Cell
+mwoColonnadeCounty cas =
+  let state = F.rgetField @GT.StateAbbreviation
+--      competitive r = let x = r ^. DO.congressionalPPL in x >= 0.45 && x <= 0.55
+--      cas' = cas <> BR.filledCell "DarkSeaGreen" `BR.cellStyleIf` \r h -> (h == "District") && competitive r
+      olStyle = BR.numberToStyledHtmlFull False (BR.cellStyle BR.CellBackground . BR.PartColor . BR.numColorWhiteUntil 50 100 300)--BR.numberToStyledHtml' False "black" 75 "green"
+  in C.headed "State District" (BR.toCell cas "District" "District" (BR.textToStyledHtml . fullDNameText))
+     <> C.headed "District D Share" (BR.toCell cas "SLD D Share" "SLD D Share" (rbStyle "%2.1f" . (100*) . view ET.demShare))
+     <> C.headed "County" (BR.toCell cas "County" "County" (BR.textToStyledHtml . show . view GT.countyName))
+     <> C.headed "Overlap" (BR.toCell cas "Overlap" "Overlap" (BR.numberToStyledHtml "%2.0f" . (100*) . view DO.overlap))
 
---aggregation :: MC.SurveyAggregation TE.EInt
-aggregation = MC.WeightedAggregation MC.ContinuousBinomial DP.DesignEffectWeights
-
-alphaModel :: MC.Alphas
-alphaModel =  MC.St_A_S_E_R_StA_StS_StE_StR_AS_AE_AR_SE_SR_ER_StER --MC.St_A_S_E_R_AE_AR_ER_StR --MC.St_A_S_E_R_ER_StR_StER
---alphaModel =  MC.St_A_S_E_R_ER_StR_StER
 
 psDataForState :: Text -> DP.PSData SLDKeyR -> DP.PSData SLDKeyR
 psDataForState sa = DP.PSData . F.filterFrame ((== sa) . view GT.stateAbbreviation) . DP.unPSData
@@ -345,8 +516,8 @@ modelNotesPost cmdLine = do
          lowerOnly r = r ^. GT.districtTypeC == GT.StateLower
 --         upperOnly r = r ^. GT.districtTypeC == GT.StateUpper
          dName = view GT.districtName
-         byDistrict r1 r2 = compare (r1 ^. GT.districtTypeC) (r2 ^. GT.districtTypeC)
-                            <> GT.districtNameCompare (r1 ^. GT.districtName) (r2 ^. GT.districtName)
+--         byDistrict r1 r2 = compare (r1 ^. GT.districtTypeC) (r2 ^. GT.districtTypeC)
+--                            <> GT.districtNameCompare (r1 ^. GT.districtName) (r2 ^. GT.districtName)
          scenarioByDistrict (r1, _) (r2, _) = byDistrict r1 r2
 
     upperOnlyMap <- BRL.stateUpperOnlyMap
@@ -413,13 +584,13 @@ modelNotesPost cmdLine = do
 -- geographic overlaps
     BRK.brAddMarkDown MN.part5
     modeledAndDRA_WI <- analyzeState cmdLine (turnoutConfig aggregation alphaModel) Nothing (prefConfig aggregation alphaModel) Nothing upperOnlyMap dlccMap "WI"
-    overlaps_WI <- DO.sldCDOverlaps upperOnlyMap singleCDMap 2024 BRC.TY2021 "WI" >>= K.knitMaybe ("modelNotesPost: DO.sldCDOverlaps returned Nothing as if WI is single district!")
+    overlaps_WI <- DO.sldCDOverlaps upperOnlyMap singleCDMap 2024 BRC.TY2021 "WI" Nothing >>= K.knitMaybe ("modelNotesPost: DO.sldCDOverlaps returned Nothing as if WI is single district!")
     let (modeledWOverlaps, mwoMissing) = FJ.leftJoinWithMissing @[GT.DistrictTypeC, GT.DistrictName] modeledAndDRA_WI overlaps_WI
     when (not $ null mwoMissing) $ K.knitError $ "modelNotesPost: missing overlaps in model+DRA/overlap join: " <> show mwoMissing
     let interestingOverlap r =
           let c x = x >= 0.45 && x <= 0.55
           in c (r ^. ET.demShare) && (r ^. DO.overlap > 0.5)
-    BR.brAddRawHtmlTable (Just "WI SLD/CD Overlaps") (BHA.class_ "brTable") (mwoColonnade mempty)
+    BR.brAddRawHtmlTable (Just "WI SLD/CD Overlaps") (BHA.class_ "brTable") (mwoColonnadeCD mempty)
       $ sortBy byDistrict $ FL.fold FL.list $ F.filterFrame interestingOverlap modeledWOverlaps
     BRK.brAddMarkDown MN.part6
     pure ()
@@ -1046,7 +1217,12 @@ dTypeText r = dTypeText' (r ^. GT.districtTypeC)
 fullDNameText :: FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName] => F.Record rs -> Text
 fullDNameText r = dTypeText r <> "-" <> r ^. GT.districtName
 
-byDistrictName :: FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName] => F.Record rs -> F.Record rs -> Ordering
+byDistrict :: (FC.ElemsOf rs [GT.DistrictTypeC, GT.DistrictName]) => F.Record rs -> F.Record rs -> Ordering
+byDistrict r1 r2 = compare (r1 ^. GT.districtTypeC) (r2 ^. GT.districtTypeC)
+                   <> byDistrictName r1 r2 --GT.districtNameCompare (r1 ^. GT.districtName) (r2 ^. GT.districtName)
+
+
+byDistrictName :: FC.ElemsOf rs '[GT.DistrictName] => F.Record rs -> F.Record rs -> Ordering
 byDistrictName r1 r2 = GT.districtNameCompare (r1 ^. GT.districtName) (r2 ^. GT.districtName)
 
 modelDRAComparisonChart :: (K.KnitEffects r

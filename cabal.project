@@ -1,4 +1,4 @@
-packages: ./
+packages: ./ ~/BlueRipple/libs/district-tools ~/BlueRipple/libs/data-overlaps
 
 jobs: 4
 with-compiler: ghc
@@ -8,6 +8,7 @@ allow-newer: base, ghc-prim, bytestring, time, primitive, containers, constraint
            , foldl-statistics:hashable, foldl-statistics:profunctors
            , cereal-time:time
            , pipes-text:text, nonlinear-optimization:vector
+           , hs-cmdstan
 
 flags: +streamly9
 
@@ -22,12 +23,13 @@ import: ../../libs/cabal_repo_imports/data-CES.project
 import: ../../libs/cabal_repo_imports/data-CPS-VS.project
 import: ../../libs/cabal_repo_imports/data-RDH-voterfiles.project
 import: ../../libs/cabal_repo_imports/data-DRA.project
-import: ../../libs/cabal_repo_imports/data-overlaps.project
+--import: ../../libs/cabal_repo_imports/data-overlaps.project
 import: ../../libs/cabal_repo_imports/data-visualizations.project
 import: ../../libs/cabal_repo_imports/model-tools.project
 import: ../../libs/cabal_repo_imports/model-demographic.project
 import: ../../libs/cabal_repo_imports/model-election2.project
 import: ../../libs/cabal_repo_imports/model-tools.project
+--import: ../../libs/cabal_repo_imports/district-tools.project
 import: ../../libs/cabal_repo_imports/haskell-stan.project
 import: ../../libs/cabal_repo_imports/hs-cmdstan.project
 import: ../../libs/cabal_repo_imports/knit-haskell.project
